@@ -1,98 +1,126 @@
 """
-app.py — Flask backend + serves the UI
-Runs inference with plain numpy (no PyTorch needed).
+app.py — local Flask server
+Run: python app.py  →  open http://localhost:5000
 
-Run locally:  python app.py
-Deploy:       push to Render / Railway (python app.py as start command)
+No NLTK, no PyTorch needed.
 """
 
+import os, re, pickle
+import numpy as np
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-import re, pickle, os, numpy as np
 
-# ── NLTK (tiny, ~3 MB) ───────────────────────────────────────────────────────
-import nltk
-nltk.download("punkt",     quiet=True)
-nltk.download("punkt_tab", quiet=True)
-nltk.download("stopwords", quiet=True)
-from nltk.tokenize import word_tokenize
-from nltk.corpus   import stopwords
-from nltk.stem     import PorterStemmer
+# ── Paths ─────────────────────────────────────────────────────────────────────
+BASE       = os.path.dirname(os.path.abspath(__file__))
+STATIC     = os.path.join(BASE, "static")
+VEC_PATH   = os.path.join(BASE, "vectorizer.pkl")
+MODEL_PATH = os.path.join(BASE, "model_weights.npz")
 
 
-# ── Pure-numpy RNN forward pass ───────────────────────────────────────────────
-class NumpyRNN:
-    """
-    Mirrors the PyTorch RNN exactly:
-      - single-layer Elman RNN, tanh activation
-      - followed by a linear (fc) layer
-      - sigmoid output
-    """
-    def __init__(self, weights_path: str):
-        w = np.load(weights_path)
-        self.W_ih = w["W_ih"]   # (hidden, input)
-        self.W_hh = w["W_hh"]   # (hidden, hidden)
-        self.b_ih = w["b_ih"]   # (hidden,)
-        self.b_hh = w["b_hh"]   # (hidden,)
-        self.W_fc = w["W_fc"]   # (1, hidden)
-        self.b_fc = w["b_fc"]   # (1,)
-        self.hidden_size = self.W_hh.shape[0]
+# ── Stopwords (no NLTK needed) ────────────────────────────────────────────────
+STOPWORDS = frozenset("""
+i me my myself we our ours ourselves you your yours yourself yourselves
+he him his himself she her hers herself it its itself they them their
+theirs themselves what which who whom this that these those am is are
+was were be been being have has had having do does did doing a an the
+and but if or because as until while of at by for with about against
+between into through during before after above below to from up down
+in out on off over under again further then once here there when where
+why how all both each few more most other some such no nor not only
+own same so than too very s t can will just don should now d ll m o
+re ve y ain aren couldn didn doesn don hadn hasn haven isn mightn
+mustn needn shan shouldn wasn weren won wouldn
+""".split())
 
-    def forward(self, x: np.ndarray) -> float:
-        """
-        x: shape (input_size,)  — one TF-IDF vector
-        returns: probability in [0, 1]
-        """
-        h = np.zeros(self.hidden_size, dtype=np.float32)
-        # single time-step (seq_len=1, same as training unsqueeze(1))
-        h = np.tanh(self.W_ih @ x + self.b_ih + self.W_hh @ h + self.b_hh)
-        logit = self.W_fc @ h + self.b_fc          # shape (1,)
-        prob  = 1.0 / (1.0 + np.exp(-logit[0]))   # sigmoid
-        return float(prob)
+# ── Regex stemmer (no NLTK needed) ────────────────────────────────────────────
+_RULES = [
+    (r'ational$','ate'),(r'tional$','tion'),(r'enci$','ence'),(r'anci$','ance'),
+    (r'izer$','ize'),(r'izing$','ize'),(r'ising$','ise'),(r'ation$','ate'),
+    (r'ator$','ate'),(r'alism$','al'),(r'iveness$','ive'),(r'fulness$','ful'),
+    (r'ousness$','ous'),(r'aliti$','al'),(r'iviti$','ive'),(r'biliti$','ble'),
+    (r'icate$','ic'),(r'alize$','al'),(r'iciti$','ic'),(r'ical$','ic'),
+    (r'ful$',''),(r'ness$',''),(r'ement$',''),(r'ment$',''),(r'ent$',''),
+    (r'ism$',''),(r'ate$',''),(r'iti$',''),(r'ous$',''),(r'ive$',''),
+    (r'ize$',''),(r'al$',''),(r'ing$',''),(r'ings$',''),(r'ied$','i'),
+    (r'ies$','i'),(r'ed$',''),(r'ly$',''),(r'er$',''),(r'est$',''),
+    (r'ion$',''),(r'tion$',''),(r'able$',''),(r'ible$',''),(r'ant$',''),
+    (r'ance$',''),(r'ence$',''),(r'ary$',''),(r'ory$',''),
+]
+_COMPILED = [(re.compile(p + '$'), r) for p, r in _RULES]
 
+def _stem(word):
+    if len(word) <= 3:
+        return word
+    for pat, rep in _COMPILED:
+        c = pat.sub(rep, word)
+        if c != word and len(c) >= 3:
+            return c
+    return word
 
-# ── Text preprocessing ────────────────────────────────────────────────────────
-def preprocess(text: str) -> str:
+def preprocess(text):
     text = text.lower()
-    text = re.sub(r"http\S+",         "", text)
-    text = re.sub(r"[^A-Za-z0-9\s]", "", text)
-    text = re.sub(r"<.*?>",           "", text)
-    tokens     = word_tokenize(text)
-    stop_words = set(stopwords.words("english"))
-    ps         = PorterStemmer()
-    return " ".join(ps.stem(t) for t in tokens if t not in stop_words)
+    text = re.sub(r'http\S+',      '', text)
+    text = re.sub(r'<.*?>',        '', text)
+    text = re.sub(r'[^a-z0-9\s]', '', text)
+    return ' '.join(_stem(t) for t in text.split()
+                    if t not in STOPWORDS and len(t) > 1)
 
 
-# ── Load artifacts at startup ─────────────────────────────────────────────────
+# ── Numpy RNN ─────────────────────────────────────────────────────────────────
+class NumpyRNN:
+    def __init__(self, path):
+        w         = np.load(path)
+        self.W_ih = w["W_ih"]
+        self.W_hh = w["W_hh"]
+        self.b_ih = w["b_ih"]
+        self.b_hh = w["b_hh"]
+        self.W_fc = w["W_fc"]
+        self.b_fc = w["b_fc"]
+        self.H    = self.W_hh.shape[0]
+
+    def predict(self, x):
+        h = np.zeros(self.H, dtype=np.float32)
+        h = np.tanh(self.W_ih @ x + self.b_ih + self.W_hh @ h + self.b_hh)
+        logit = (self.W_fc @ h + self.b_fc)[0]
+        return float(1.0 / (1.0 + np.exp(-logit)))
+
+
+# ── Load model & vectorizer ───────────────────────────────────────────────────
 model      = None
 vectorizer = None
 
-if os.path.exists("vectorizer.pkl"):
-    with open("vectorizer.pkl", "rb") as f:
-        vectorizer = pickle.load(f)
-    print("✓  vectorizer loaded")
+try:
+    if os.path.exists(VEC_PATH):
+        with open(VEC_PATH, "rb") as f:
+            vectorizer = pickle.load(f)
+        print("✓  vectorizer loaded")
+    else:
+        print("⚠  vectorizer.pkl not found")
 
-if os.path.exists("model_weights.npz") and vectorizer is not None:
-    model = NumpyRNN("model_weights.npz")
-    print("✓  model weights loaded (numpy)")
-else:
-    print("⚠  model_weights.npz not found — using rule-based fallback")
-    print("   Run: python export_model.py")
+    if os.path.exists(MODEL_PATH) and vectorizer is not None:
+        model = NumpyRNN(MODEL_PATH)
+        print("✓  model loaded")
+    else:
+        print("⚠  model_weights.npz not found — using rule-based fallback")
+        print("   Run: python export_model.py")
+except Exception as e:
+    print(f"⚠  Error loading model: {e}")
 
 
-# ── Flask ─────────────────────────────────────────────────────────────────────
-app = Flask(__name__, static_folder=".")
+# ── Flask app ─────────────────────────────────────────────────────────────────
+app = Flask(__name__)
 CORS(app)
+
 
 @app.route("/")
 def index():
-    return send_from_directory(".", "index.html")
+    return send_from_directory(STATIC, "index.html")
 
 @app.route("/health")
 def health():
     return jsonify({
-        "status":           "ok",
-        "model_loaded":     model is not None,
+        "status":            "ok",
+        "model_loaded":      model is not None,
         "vectorizer_loaded": vectorizer is not None,
     })
 
@@ -105,38 +133,40 @@ def predict():
 
     processed = preprocess(text)
 
-    # ── Rule-based fallback ───────────────────────────────────────────────
+    # Rule-based fallback
     if model is None or vectorizer is None:
-        pos_words = {"good","great","excellent","amazing","wonderful","fantastic",
-                     "love","best","brilliant","outstanding","superb","beautiful",
-                     "enjoy","perfect","incredible","awesome","terrific","masterpiece",
-                     "hilarious","touching","inspiring","entertaining","delightful"}
-        neg_words = {"bad","terrible","awful","worst","horrible","hate","boring",
-                     "dull","waste","disappointing","poor","mediocre","dreadful",
-                     "annoying","stupid","pathetic","useless","garbage","trash",
-                     "disaster","rubbish","ridiculous"}
+        POS = {"good","great","excel","amaz","wonder","fantast","love","best",
+               "brilliant","outstand","superb","beauti","enjoy","perfect",
+               "incred","awesom","terrif","masterpiec","hilari","touch",
+               "inspir","entertain","delight"}
+        NEG = {"bad","terribl","awful","worst","horribl","hate","bore","dull",
+               "wast","disappoint","poor","mediocr","dread","annoy","stupid",
+               "pathet","useless","garbage","trash","disast","rubbish","ridicul"}
         words = set(processed.split())
-        pos   = len(words & pos_words)
-        neg   = len(words & neg_words)
-        total = pos + neg or 1
-        if pos >= neg:
-            label      = "positive"
-            confidence = round(min(50 + (pos - neg) / total * 50, 99), 1)
-        else:
-            label      = "negative"
-            confidence = round(min(50 + (neg - pos) / total * 50, 99), 1)
-        return jsonify({"sentiment": label, "confidence": confidence, "model_loaded": False})
+        p, n  = len(words & POS), len(words & NEG)
+        total = p + n or 1
+        label = "positive" if p >= n else "negative"
+        conf  = round(min(50 + abs(p - n) / total * 50, 99), 1)
+        return jsonify({"sentiment": label, "confidence": conf, "model_loaded": False})
 
-    # ── Numpy RNN inference ───────────────────────────────────────────────
-    x    = vectorizer.transform([processed]).toarray()[0].astype(np.float32)
-    prob = model.forward(x)
-
-    label      = "positive" if prob >= 0.5 else "negative"
-    confidence = round((prob if prob >= 0.5 else 1 - prob) * 100, 1)
-
-    return jsonify({"sentiment": label, "confidence": confidence, "model_loaded": True})
+    # RNN inference
+    x     = vectorizer.transform([processed]).toarray()[0].astype(np.float32)
+    prob  = model.predict(x)
+    label = "positive" if prob >= 0.5 else "negative"
+    conf  = round((prob if prob >= 0.5 else 1 - prob) * 100, 1)
+    return jsonify({"sentiment": label, "confidence": conf, "model_loaded": True})
 
 
 if __name__ == "__main__":
-    print("\n✓  Open http://localhost:5000\n")
+    # Sanity check
+    if not os.path.exists(STATIC):
+        print(f"\n✗  ERROR: 'static/' folder not found at {STATIC}")
+        print("   Create a 'static/' folder and put index.html inside it.\n")
+    elif not os.path.exists(os.path.join(STATIC, "index.html")):
+        print(f"\n✗  ERROR: static/index.html not found")
+        print("   Make sure index.html is inside the 'static/' folder.\n")
+    else:
+        print("\n✓  static/index.html found")
+
+    print("✓  Starting server →  http://localhost:5000\n")
     app.run(debug=True, port=5000)

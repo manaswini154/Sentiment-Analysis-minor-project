@@ -1,11 +1,20 @@
+# Python
 .venv/
-# --- Python & Environments ---
-
+venv/
 __pycache__/
 *.py[cod]
-*$py.class
+*.pyo
 
-# --- VS Code & IDEs ---
+# Training artifacts — too large for git
+model.pt
+IMDB\ Dataset.csv
+IMDB_Dataset.csv
+
+# IDE
 .vscode/
 .idea/
+
+# OS
+.DS_Store
+Thumbs.db
 
